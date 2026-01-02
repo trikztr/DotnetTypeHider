@@ -1,40 +1,44 @@
 ﻿using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
+using AsmResolver.DotNet.Signatures.Types;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables.Rows;
 
 var module = ModuleDefinition.FromFile(args[0]);
-var factory = module.CorLibTypeFactory;
+HideTypes(module);
+HideCalls(module);
+module.Write("out.dll");
+return;
 
-// CompilerGeneratedAttribute ctor
-var compilerGeneratedAttribute = factory
-    .CorLibScope.CreateTypeReference(
-        "System.Runtime.CompilerServices",
-        "CompilerGeneratedAttribute"
-    )
-    .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void))
-    .ImportWith(module.DefaultImporter);
-
-// Rename + mark types
-foreach (var type in module.GetAllTypes())
+static void HideTypes(ModuleDefinition module)
 {
-    if (type.IsValueType || !type.IsClass || type.IsModuleType || type.IsCompilerGenerated())
-        continue;
-
-    type.CustomAttributes.Add(new CustomAttribute(compilerGeneratedAttribute));
-    type.Name = $"<>AnonType_{type.MetadataToken}";
-}
-
-// Hide calls in anonymous types constructors
-foreach (var type in module.GetAllTypes())
-{
-    foreach (var method in type.Methods)
+    foreach (var type in module.GetAllTypes())
     {
-        if (method.CilMethodBody is not { } body)
+        if (
+            type.IsValueType
+            || !type.IsClass
+            || type.IsModuleType
+            || type.IsCompilerGenerated()
+            || type == module.ManagedEntryPointMethod?.DeclaringType
+        )
             continue;
 
-        var instructions = body.Instructions;
+        type.CustomAttributes.Add(new CustomAttribute(GetCompilerGeneratedAttribute(module)));
+        type.Name = RandomAnonymousTypeName();
+    }
+}
+
+static void HideCalls(ModuleDefinition module)
+{
+    Dictionary<IMethodDescriptor, IMethodDefOrRef> cache = new(ReferenceEqualityComparer.Instance);
+    foreach (var method in module.GetAllTypes().SelectMany(type => type.Methods))
+    {
+        if (
+            method
+            is not { Signature: { }, CilMethodBody.Instructions: { Count: > 1 } instructions }
+        )
+            continue;
 
         for (int i = 0; i < instructions.Count; i++)
         {
@@ -47,16 +51,20 @@ foreach (var type in module.GetAllTypes())
                     {
                         Signature: { ReturnsValue: false, HasThis: false }
                     } targetDescriptor
-                || targetDescriptor.Resolve() is not { } target
             )
                 continue;
 
-            var anonymousType = CreateAnonymousTypeForCall(module, target);
-            var anonymousTypeConstructor = anonymousType.Methods.Single(m => m.Name == ".ctor");
+            if (!cache.TryGetValue(targetDescriptor, out var anonymousTypeConstructor))
+            {
+                anonymousTypeConstructor = cache[targetDescriptor] =
+                    module.DefaultImporter.ImportMethod(
+                        HideCallInAnonymousTypeConstructor(module, targetDescriptor)
+                    );
+            }
 
             // Replace call with newobj
             instruction.OpCode = CilOpCodes.Newobj;
-            instruction.Operand = module.DefaultImporter.ImportMethod(anonymousTypeConstructor);
+            instruction.Operand = anonymousTypeConstructor;
 
             // Discard created object
             instructions.Insert(i + 1, CilOpCodes.Pop);
@@ -65,22 +73,22 @@ foreach (var type in module.GetAllTypes())
     }
 }
 
-module.Write("out.dll");
-return;
-
-TypeDefinition CreateAnonymousTypeForCall(ModuleDefinition module, MethodDefinition target)
+static (TypeDefinition AnonymousObject, MethodDefinition Constructor) CreateAnonymousObjectType(
+    ModuleDefinition module,
+    TypeSignature[] parameterTypes
+)
 {
     var anonymousType = new TypeDefinition(
         "",
-        $"<>AnonType_{Guid.NewGuid():N}",
+        RandomAnonymousTypeName(),
         TypeAttributes.Class | TypeAttributes.NotPublic | TypeAttributes.Sealed,
-        factory.Object.Type
+        module.CorLibTypeFactory.Object.Type
     );
-    anonymousType.CustomAttributes.Add(new CustomAttribute(compilerGeneratedAttribute));
+    anonymousType.CustomAttributes.Add(new CustomAttribute(GetCompilerGeneratedAttribute(module)));
 
     var constructorSignature = MethodSignature.CreateInstance(
-        factory.Void,
-        [.. target.Signature!.ParameterTypes]
+        module.CorLibTypeFactory.Void,
+        parameterTypes
     );
     var constructor = new MethodDefinition(
         ".ctor",
@@ -95,28 +103,62 @@ TypeDefinition CreateAnonymousTypeForCall(ModuleDefinition module, MethodDefinit
     var instructions = body.Instructions;
 
     // object::.ctor
-    var objectConstructor = factory.Object.Type.Resolve()!.GetConstructor()!;
+    var objectConstructor = module.CorLibTypeFactory.Object.Type.Resolve()!.GetConstructor()!;
 
     instructions.Add(CilOpCodes.Ldarg_0);
     instructions.Add(CilOpCodes.Call, module.DefaultImporter.ImportMethod(objectConstructor));
-
-    // forward arguments
-    for (int i = 0; i < constructor.Parameters.Count; i++)
-    {
-        instructions.Add(CilOpCodes.Ldarg, constructor.Parameters[i]);
-    }
-
-    instructions.Add(
-        target.IsVirtual ? CilOpCodes.Callvirt : CilOpCodes.Call,
-        module.DefaultImporter.ImportMethod(target)
-    );
-
     instructions.Add(CilOpCodes.Ret);
     instructions.CalculateOffsets();
+    body.ComputeMaxStack();
 
     constructor.CilMethodBody = body;
     anonymousType.Methods.Add(constructor);
     module.TopLevelTypes.Add(anonymousType);
 
-    return anonymousType;
+    return (anonymousType, constructor);
 }
+
+static MethodDefinition HideCallInAnonymousTypeConstructor(
+    ModuleDefinition module,
+    IMethodDescriptor target
+)
+{
+    var (anonymousType, constructor) = CreateAnonymousObjectType(
+        module,
+        [.. target.Signature!.ParameterTypes]
+    );
+
+    var body = constructor.CilMethodBody!;
+    var instructions = body.Instructions;
+
+    // forward arguments
+    for (int i = 0; i < constructor.Parameters.Count; i++)
+    {
+        instructions.Insert(instructions.Count - 1, CilOpCodes.Ldarg, constructor.Parameters[i]);
+    }
+
+    instructions.Insert(
+        instructions.Count - 1,
+        target.Signature.HasThis ? CilOpCodes.Callvirt : CilOpCodes.Call,
+        module.DefaultImporter.ImportMethod(target)
+    );
+
+    instructions.CalculateOffsets();
+    body.ComputeMaxStack();
+
+    return constructor;
+}
+
+static string RandomAnonymousTypeName() => $"<>AnonType_{Guid.NewGuid():N}";
+
+static MemberReference GetCompilerGeneratedAttribute(ModuleDefinition module) =>
+    module
+        .CorLibTypeFactory.CorLibScope.CreateTypeReference(
+            "System.Runtime.CompilerServices",
+            "CompilerGeneratedAttribute"
+        )
+        .CreateMemberReference(
+            ".ctor",
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void)
+        )
+        .ImportWith(module.DefaultImporter);
