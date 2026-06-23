@@ -15,10 +15,38 @@ common .NET decompilers.
 This project is inspired by
 [Washi1337/AwaitFuscator](https://github.com/Washi1337/AwaitFuscator).
 
+## Requirements
+
+- .NET SDK 10.0 or newer
+
+## Build
+
+```powershell
+dotnet restore
+dotnet build
+```
+
+## Usage
+
+```powershell
+dotnet run --project src/DotnetTypeHider -- path\to\input.dll
+```
+
+The rewritten assembly is written to `out.dll` in the current working directory.
+
+## Formatting
+
+This repository uses CSharpier as a pinned local .NET tool:
+
+```powershell
+dotnet tool restore
+dotnet csharpier format .
+```
+
 ## Example
 
 ### Input
-![Input Program](input.png)
+![Input Program](docs/media/input.png)
 
 ### Output
-![Output Program](output.png)
+![Output Program](docs/media/output.png)
